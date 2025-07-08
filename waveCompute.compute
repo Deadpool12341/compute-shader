@@ -1,0 +1,249 @@
+﻿#pragma kernel CSMain
+#include "UnityCG.cginc"
+
+// Buffers and resources
+StructuredBuffer<float3>   _InputPositions;
+RWStructuredBuffer<float3> _OutputPositions;
+RWStructuredBuffer<float4> _VertexColors;
+Texture2D<float4>          _DeformationTex;
+
+// Sampler state for texture sampling
+SamplerState linearClampSampler {
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Clamp;
+    AddressV = Clamp; // Keep clamped to avoid boundary issues
+};
+
+// Parameters
+int   _NumVertices;
+float _HalfWidth;
+float _HalfLength;
+float _Displacement;
+float _AnimStart;
+float _AnimEnd;
+float _QuadStart;
+float _QuadEnd;
+int   _SubCount;
+int   _GridSizeX;
+int   _GridSizeZ;
+float _RegionWidth;
+float _ZScale;
+float _FixedZEnd;
+
+[numthreads(128, 1, 1)]
+void CSMain(uint3 threadID : SV_DispatchThreadID)
+{
+    uint idx = threadID.x;
+    if (idx >= _NumVertices) return;
+
+    float3 pos = _InputPositions[idx];
+
+    // Normalize X/Z to [0,1] based on world extents
+    float normX = (pos.x + _HalfWidth) / (_HalfWidth * 2.0);
+    float normZ = (pos.z + _HalfLength) / (_HalfLength * 2.0);
+
+    // 1) Calculate the current active Z-boundaries of the quad
+    float activeZMin, activeZMax;
+    
+    if (_FixedZEnd < 0.5) {
+        // Shrinking toward negative end (front), positive end (back) is fixed
+        activeZMin = lerp(-_HalfLength, _HalfLength, 1.0 - _ZScale); // Shrinks inward from negative end
+        activeZMax = _HalfLength; // Fixed positive end
+    } else {
+        // Shrinking toward positive end (back), negative end (front) is fixed  
+        activeZMin = -_HalfLength; // Fixed negative end
+        activeZMax = lerp(_HalfLength, -_HalfLength, 1.0 - _ZScale); // Shrinks inward from positive end
+    }
+
+    // 2) Check if vertex is outside the active quad boundaries (X or Z)
+    if (normX < _QuadStart || normX >= _QuadEnd || 
+        pos.z < activeZMin || pos.z > activeZMax)
+    {
+        _OutputPositions[idx] = pos;
+        _VertexColors[idx] = float4(1, 1, 1, 1); // White for vertices outside active area
+        return;
+    }
+
+    // 3) Vertex is inside active quad - apply overlapping sub-quad deformation
+    // Compute front-to-back fraction within the quad
+    float regionW = _QuadEnd - _QuadStart;
+    float relX = (normX - _QuadStart) / regionW;
+
+    // Helper function to decode texture sample
+    #define DecodeSample(uv) ((_DeformationTex.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - float3(188, 188, 188)) * _Displacement)
+    
+    // Calculate active area boundaries in normalized space
+    float activeNormZMin = (activeZMin + _HalfLength) / (_HalfLength * 2.0);
+    float activeNormZMax = (activeZMax + _HalfLength) / (_HalfLength * 2.0);
+    
+    // Key insight: All 10 sub-quads maintain their logical positions [0,1]
+    // When quad shrinks, they get compressed into smaller physical space
+    // This compression creates overlaps between adjacent sub-quads
+    
+    float3 accumO = float3(0, 0, 0); // Accumulated offset
+    float accumW = 0.0;              // Accumulated weight  
+    int hitCount = 0;                // Track how many sub-quads contribute
+    
+    // Sub-quad parameters in logical [0,1] space
+    float subWindowZ = 1.0 / _SubCount; // Size of each sub-window (0.1 for 10 sub-quads)
+    
+    // Calculate compression factor: how much the logical space is compressed
+    float compressionFactor = 1.0 / _ZScale; // When _ZScale=0.7, compression=1.43
+    
+    // Map vertex's physical position to compressed logical position
+    float logicalZ = (normZ - activeNormZMin) / (activeNormZMax - activeNormZMin);
+    
+    // Check all 10 sub-quads to see which ones influence this vertex
+    for (int i = 0; i < _SubCount; i++)
+    {
+        // Sub-quad boundaries in logical [0,1] space
+        float startZ = i * subWindowZ;
+        float endZ = (i + 1) * subWindowZ;
+        
+        // Due to compression, calculate the "spread" of this sub-quad
+        float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
+        float effectiveStartZ = startZ - spreadRadius;
+        float effectiveEndZ = endZ + spreadRadius;
+        
+        // Check if vertex's logical position overlaps with this compressed sub-quad
+        if (logicalZ >= effectiveStartZ && logicalZ <= effectiveEndZ)
+        {
+            // Calculate position within the effective sub-quad range
+            float effectiveRange = effectiveEndZ - effectiveStartZ;
+            float t = (logicalZ - effectiveStartZ) / effectiveRange;
+            
+            // Triangular weight: maximum in middle, tapering at edges
+            float w = saturate(1.0 - abs(2.0 * t - 1.0));
+            
+            if (w > 0.0)
+            {
+                hitCount++;
+                
+                // Animation parameters at original sub-quad boundaries
+                // Handle wrap-around case when _AnimStart > _AnimEnd
+                float t_i = i / float(_SubCount);
+                float t_i1 = (i + 1) / float(_SubCount);
+                
+                float paramL, paramR;
+                if (_AnimStart <= _AnimEnd) {
+                    // Normal case: no wrap-around
+                    paramL = lerp(_AnimStart, _AnimEnd, t_i);
+                    paramR = lerp(_AnimStart, _AnimEnd, t_i1);
+                } else {
+                    // Wrap-around case: _AnimStart > _AnimEnd
+                    // We need to interpolate across the 0.0/1.0 boundary
+                    float adjustedEnd = _AnimEnd + 1.0; // Treat as if _AnimEnd is beyond 1.0
+                    paramL = fmod(lerp(_AnimStart, adjustedEnd, t_i), 1.0);
+                    paramR = fmod(lerp(_AnimStart, adjustedEnd, t_i1), 1.0);
+                }
+                
+                // Sample and interpolate based on position within original sub-quad
+                float originalT = (logicalZ - startZ) / subWindowZ;
+                originalT = saturate(originalT); // Clamp to [0,1]
+                
+                float2 uvL = float2(relX, paramL);
+                float2 uvR = float2(relX, paramR);
+                float3 sampL = DecodeSample(uvL);
+                float3 sampR = DecodeSample(uvR);
+                float3 raw = lerp(sampL, sampR, originalT);
+                
+                // Accumulate with weight
+                accumO += raw * w;
+                accumW += w;
+            }
+        }
+    }
+    
+    // Normalize and apply final offset
+    if (accumW > 0.0) 
+        accumO /= accumW;
+    
+    // 4) Channel mapping: X=pow(Z,1.4), Y=-Y, Z=0
+    float3 offWorld = float3(pow(accumO.z, 1.4), -accumO.y, 0);
+    
+    // Apply ONLY deformation offset (no additional scaling)
+    _OutputPositions[idx] = pos + offWorld;
+    
+    // 9) Calculate vertex colors - allow boundaries to show within overlap regions
+    float4 vertexColor = float4(1, 1, 1, 1); // Default white
+    
+    // Start with overlap regions as base color
+    bool isOverlap = (hitCount > 1);
+    if (isOverlap)
+    {
+        vertexColor = float4(0, 0, 1, 1); // Blue for overlap regions
+    }
+    
+    // Check if we're on active quad boundary (green edges) - highest priority
+    bool isQuadEdge = false;
+    if (normX >= _QuadStart && normX <= _QuadEnd && 
+        normZ >= activeNormZMin && normZ <= activeNormZMax)
+    {
+        // Check X boundaries (front/back of quad)
+        float relativeX = (normX - _QuadStart) / (_QuadEnd - _QuadStart);
+        if (relativeX <= 0.01 || relativeX >= 0.99)
+            isQuadEdge = true;
+            
+        // Check Z boundaries (edges of active area)
+        float tolerance = 0.01;
+        if (abs(normZ - activeNormZMin) <= tolerance || abs(normZ - activeNormZMax) <= tolerance)
+            isQuadEdge = true;
+    }
+    
+    // Check if we're on edges of blue overlap regions (red lines)
+    bool isSubQuadEdge = false;
+    if (normX >= _QuadStart && normX <= _QuadEnd &&
+        normZ >= activeNormZMin && normZ <= activeNormZMax)
+    {
+        // Use the same compression logic as the deformation calculation
+        float logicalZ = (normZ - activeNormZMin) / (activeNormZMax - activeNormZMin);
+        float subWindowZ = 1.0 / _SubCount;
+        float compressionFactor = 1.0 / _ZScale;
+        
+        // Check for edges of overlap regions between adjacent sub-quads
+        for (int i = 0; i < _SubCount - 1; i++) // Check boundaries between sub-quads
+        {
+            // Sub-quad i boundaries
+            float startZi = i * subWindowZ;
+            float endZi = (i + 1) * subWindowZ;
+            
+            // Sub-quad i+1 boundaries  
+            float startZi1 = (i + 1) * subWindowZ;
+            float endZi1 = (i + 2) * subWindowZ;
+            
+            // Calculate spread due to compression
+            float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
+            
+            // Effective boundaries after compression
+            float effectiveEndZi = endZi + spreadRadius;     // Right edge of sub-quad i
+            float effectiveStartZi1 = startZi1 - spreadRadius; // Left edge of sub-quad i+1
+            
+            // Red lines should appear at the edges of overlap regions
+            // Left edge of overlap (where sub-quad i+1 starts overlapping with i)
+            if (abs(logicalZ - effectiveStartZi1) <= 0.002)
+            {
+                isSubQuadEdge = true;
+                break;
+            }
+            
+            // Right edge of overlap (where sub-quad i stops overlapping with i+1)
+            if (abs(logicalZ - effectiveEndZi) <= 0.002)
+            {
+                isSubQuadEdge = true;
+                break;
+            }
+        }
+    }
+    
+    // Apply priority: Green > Red > Blue > White
+    // Red lines can now appear on top of blue overlap regions
+    if (isQuadEdge)
+        vertexColor = float4(0, 1, 0, 1); // Green (highest priority)
+    else if (isSubQuadEdge)
+        vertexColor = float4(1, 0, 0, 1); // Red (medium priority, overrides blue)
+    // Blue overlap and white default already handled above
+    
+    _VertexColors[idx] = vertexColor;
+}
+
+
