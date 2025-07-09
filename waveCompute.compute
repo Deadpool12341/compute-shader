@@ -3,9 +3,13 @@
 
 // Buffers and resources
 StructuredBuffer<float3>   _InputPositions;
+StructuredBuffer<float3>   _InputNormals;
 RWStructuredBuffer<float3> _OutputPositions;
 RWStructuredBuffer<float4> _VertexColors;
+RWStructuredBuffer<float3> _OutputNormals;
 Texture2D<float4>          _DeformationTex;
+Texture2D<float4>          _PartialDerivativesDU; // ∂D/∂u (colorful texture)
+Texture2D<float4>          _PartialDerivativesDV; // ∂D/∂v (gray texture)
 
 // Sampler state for texture sampling
 SamplerState linearClampSampler {
@@ -44,23 +48,25 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
 
     // 1) Calculate the current active Z-boundaries of the quad
     float activeZMin, activeZMax;
-    
+
     if (_FixedZEnd < 0.5) {
         // Shrinking toward negative end (front), positive end (back) is fixed
         activeZMin = lerp(-_HalfLength, _HalfLength, 1.0 - _ZScale); // Shrinks inward from negative end
         activeZMax = _HalfLength; // Fixed positive end
-    } else {
+    }
+    else {
         // Shrinking toward positive end (back), negative end (front) is fixed  
         activeZMin = -_HalfLength; // Fixed negative end
         activeZMax = lerp(_HalfLength, -_HalfLength, 1.0 - _ZScale); // Shrinks inward from positive end
     }
 
     // 2) Check if vertex is outside the active quad boundaries (X or Z)
-    if (normX < _QuadStart || normX >= _QuadEnd || 
+    if (normX < _QuadStart || normX >= _QuadEnd ||
         pos.z < activeZMin || pos.z > activeZMax)
     {
         _OutputPositions[idx] = pos;
         _VertexColors[idx] = float4(1, 1, 1, 1); // White for vertices outside active area
+        _OutputNormals[idx] = _InputNormals[idx]; // Use original normal
         return;
     }
 
@@ -70,126 +76,131 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
     float relX = (normX - _QuadStart) / regionW;
 
     // Helper function to decode texture sample
-    #define DecodeSample(uv) ((_DeformationTex.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - float3(188, 188, 188)) * _Displacement)
+#define DecodeSample(uv) ((_DeformationTex.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - float3(188, 188, 188)) * _Displacement)
     
-    // Calculate active area boundaries in normalized space
+    // Helper functions to decode derivative texture samples
+#define DecodeDerivativeDU(uv) ((_PartialDerivativesDU.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - float3(188, 188, 188)) * _Displacement)
+#define DecodeDerivativeDV(uv) ((_PartialDerivativesDV.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - float3(188, 188, 188)) * _Displacement)
+
+// Calculate active area boundaries in normalized space
     float activeNormZMin = (activeZMin + _HalfLength) / (_HalfLength * 2.0);
     float activeNormZMax = (activeZMax + _HalfLength) / (_HalfLength * 2.0);
-    
+
     // Key insight: All 10 sub-quads maintain their logical positions [0,1]
     // When quad shrinks, they get compressed into smaller physical space
     // This compression creates overlaps between adjacent sub-quads
-    
+
     float3 accumO = float3(0, 0, 0); // Accumulated offset
     float accumW = 0.0;              // Accumulated weight  
     int hitCount = 0;                // Track how many sub-quads contribute
-    
+
     // Sub-quad parameters in logical [0,1] space
     float subWindowZ = 1.0 / _SubCount; // Size of each sub-window (0.1 for 10 sub-quads)
-    
+
     // Calculate compression factor: how much the logical space is compressed
     float compressionFactor = 1.0 / _ZScale; // When _ZScale=0.7, compression=1.43
-    
+
     // Map vertex's physical position to compressed logical position
     float logicalZ = (normZ - activeNormZMin) / (activeNormZMax - activeNormZMin);
-    
+
     // Check all 10 sub-quads to see which ones influence this vertex
     for (int i = 0; i < _SubCount; i++)
     {
         // Sub-quad boundaries in logical [0,1] space
         float startZ = i * subWindowZ;
         float endZ = (i + 1) * subWindowZ;
-        
+
         // Due to compression, calculate the "spread" of this sub-quad
         float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
         float effectiveStartZ = startZ - spreadRadius;
         float effectiveEndZ = endZ + spreadRadius;
-        
+
         // Check if vertex's logical position overlaps with this compressed sub-quad
         if (logicalZ >= effectiveStartZ && logicalZ <= effectiveEndZ)
         {
             // Calculate position within the effective sub-quad range
             float effectiveRange = effectiveEndZ - effectiveStartZ;
             float t = (logicalZ - effectiveStartZ) / effectiveRange;
-            
+
             // Triangular weight: maximum in middle, tapering at edges
             float w = saturate(1.0 - abs(2.0 * t - 1.0));
-            
+
             if (w > 0.0)
             {
                 hitCount++;
-                
+
                 // Animation parameters at original sub-quad boundaries
                 // Handle wrap-around case when _AnimStart > _AnimEnd
                 float t_i = i / float(_SubCount);
                 float t_i1 = (i + 1) / float(_SubCount);
-                
+
                 float paramL, paramR;
                 if (_AnimStart <= _AnimEnd) {
                     // Normal case: no wrap-around
                     paramL = lerp(_AnimStart, _AnimEnd, t_i);
                     paramR = lerp(_AnimStart, _AnimEnd, t_i1);
-                } else {
+                }
+                else {
                     // Wrap-around case: _AnimStart > _AnimEnd
                     // We need to interpolate across the 0.0/1.0 boundary
                     float adjustedEnd = _AnimEnd + 1.0; // Treat as if _AnimEnd is beyond 1.0
                     paramL = fmod(lerp(_AnimStart, adjustedEnd, t_i), 1.0);
                     paramR = fmod(lerp(_AnimStart, adjustedEnd, t_i1), 1.0);
                 }
-                
+
                 // Sample and interpolate based on position within original sub-quad
                 float originalT = (logicalZ - startZ) / subWindowZ;
                 originalT = saturate(originalT); // Clamp to [0,1]
-                
+
                 float2 uvL = float2(relX, paramL);
                 float2 uvR = float2(relX, paramR);
                 float3 sampL = DecodeSample(uvL);
                 float3 sampR = DecodeSample(uvR);
                 float3 raw = lerp(sampL, sampR, originalT);
-                
+
                 // Accumulate with weight
                 accumO += raw * w;
                 accumW += w;
             }
         }
     }
-    
+
     // Normalize and apply final offset
-    if (accumW > 0.0) 
+    if (accumW > 0.0)
         accumO /= accumW;
-    
+
     // 4) Channel mapping: X=pow(Z,1.4), Y=-Y, Z=0
     float3 offWorld = float3(pow(accumO.z, 1.4), -accumO.y, 0);
-    
+
     // Apply ONLY deformation offset (no additional scaling)
     _OutputPositions[idx] = pos + offWorld;
-    
+
     // 9) Calculate vertex colors - allow boundaries to show within overlap regions
     float4 vertexColor = float4(1, 1, 1, 1); // Default white
-    
+
     // Start with overlap regions as base color
     bool isOverlap = (hitCount > 1);
     if (isOverlap)
     {
         vertexColor = float4(0, 0, 1, 1); // Blue for overlap regions
     }
-    
+
     // Check if we're on active quad boundary (green edges) - highest priority
     bool isQuadEdge = false;
-    if (normX >= _QuadStart && normX <= _QuadEnd && 
+    if (normX >= _QuadStart && normX <= _QuadEnd &&
         normZ >= activeNormZMin && normZ <= activeNormZMax)
     {
         // Check X boundaries (front/back of quad)
         float relativeX = (normX - _QuadStart) / (_QuadEnd - _QuadStart);
         if (relativeX <= 0.01 || relativeX >= 0.99)
             isQuadEdge = true;
-            
+
         // Check Z boundaries (edges of active area)
         float tolerance = 0.01;
         if (abs(normZ - activeNormZMin) <= tolerance || abs(normZ - activeNormZMax) <= tolerance)
             isQuadEdge = true;
     }
-    
+
     // Check if we're on edges of blue overlap regions (red lines)
     bool isSubQuadEdge = false;
     if (normX >= _QuadStart && normX <= _QuadEnd &&
@@ -199,25 +210,25 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
         float logicalZ = (normZ - activeNormZMin) / (activeNormZMax - activeNormZMin);
         float subWindowZ = 1.0 / _SubCount;
         float compressionFactor = 1.0 / _ZScale;
-        
+
         // Check for edges of overlap regions between adjacent sub-quads
         for (int i = 0; i < _SubCount - 1; i++) // Check boundaries between sub-quads
         {
             // Sub-quad i boundaries
             float startZi = i * subWindowZ;
             float endZi = (i + 1) * subWindowZ;
-            
+
             // Sub-quad i+1 boundaries  
             float startZi1 = (i + 1) * subWindowZ;
             float endZi1 = (i + 2) * subWindowZ;
-            
+
             // Calculate spread due to compression
             float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
-            
+
             // Effective boundaries after compression
             float effectiveEndZi = endZi + spreadRadius;     // Right edge of sub-quad i
             float effectiveStartZi1 = startZi1 - spreadRadius; // Left edge of sub-quad i+1
-            
+
             // Red lines should appear at the edges of overlap regions
             // Left edge of overlap (where sub-quad i+1 starts overlapping with i)
             if (abs(logicalZ - effectiveStartZi1) <= 0.002)
@@ -225,7 +236,7 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
                 isSubQuadEdge = true;
                 break;
             }
-            
+
             // Right edge of overlap (where sub-quad i stops overlapping with i+1)
             if (abs(logicalZ - effectiveEndZi) <= 0.002)
             {
@@ -234,7 +245,7 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
             }
         }
     }
-    
+
     // Apply priority: Green > Red > Blue > White
     // Red lines can now appear on top of blue overlap regions
     if (isQuadEdge)
@@ -242,8 +253,110 @@ void CSMain(uint3 threadID : SV_DispatchThreadID)
     else if (isSubQuadEdge)
         vertexColor = float4(1, 0, 0, 1); // Red (medium priority, overrides blue)
     // Blue overlap and white default already handled above
-    
-    _VertexColors[idx] = vertexColor;
-}
 
+    _VertexColors[idx] = vertexColor;
+
+    // 10) Calculate proper normals using partial derivatives
+    float3 normal = _InputNormals[idx]; // Use original mesh normal as default
+    
+    // For vertices outside the active area, keep default up normal
+    if (accumW > 0.0)
+    {
+        // Sample derivatives at the same UV coordinates used for deformation
+        float3 accumDu = float3(0, 0, 0); // Accumulated ∂D/∂u
+        float3 accumDv = float3(0, 0, 0); // Accumulated ∂D/∂v
+        float accumDerivW = 0.0;          // Accumulated derivative weights
+        
+        // Use same sub-quad logic to accumulate derivatives
+        for (int i = 0; i < _SubCount; i++)
+        {
+            float startZ = i * subWindowZ;
+            float endZ = (i + 1) * subWindowZ;
+            
+            float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
+            float effectiveStartZ = startZ - spreadRadius;
+            float effectiveEndZ = endZ + spreadRadius;
+            
+            if (logicalZ >= effectiveStartZ && logicalZ <= effectiveEndZ)
+            {
+                float effectiveRange = effectiveEndZ - effectiveStartZ;
+                float t = (logicalZ - effectiveStartZ) / effectiveRange;
+                float w = saturate(1.0 - abs(2.0 * t - 1.0));
+                
+                if (w > 0.0)
+                {
+                    // Same animation parameter calculation as deformation
+                    float t_i = i / float(_SubCount);
+                    float t_i1 = (i + 1) / float(_SubCount);
+                    
+                    float paramL, paramR;
+                    if (_AnimStart <= _AnimEnd) {
+                        paramL = lerp(_AnimStart, _AnimEnd, t_i);
+                        paramR = lerp(_AnimStart, _AnimEnd, t_i1);
+                    }
+                    else {
+                        float adjustedEnd = _AnimEnd + 1.0;
+                        paramL = fmod(lerp(_AnimStart, adjustedEnd, t_i), 1.0);
+                        paramR = fmod(lerp(_AnimStart, adjustedEnd, t_i1), 1.0);
+                    }
+                    
+                    float originalT = (logicalZ - startZ) / subWindowZ;
+                    originalT = saturate(originalT);
+                    
+                    // Sample both derivative textures at the same UV coordinates
+                    float2 uvL = float2(relX, paramL);
+                    float2 uvR = float2(relX, paramR);
+                    
+                    // Sample ∂D/∂u derivatives
+                    float3 duL = DecodeDerivativeDU(uvL);
+                    float3 duR = DecodeDerivativeDU(uvR);
+                    float3 duInterp = lerp(duL, duR, originalT);
+                    
+                    // Sample ∂D/∂v derivatives  
+                    float3 dvL = DecodeDerivativeDV(uvL);
+                    float3 dvR = DecodeDerivativeDV(uvR);
+                    float3 dvInterp = lerp(dvL, dvR, originalT);
+                    
+                    accumDu += duInterp * w;
+                    accumDv += dvInterp * w;
+                    accumDerivW += w;
+                }
+            }
+        }
+        
+        if (accumDerivW > 0.0)
+        {
+            accumDu /= accumDerivW;
+            accumDv /= accumDerivW;
+            
+            // Apply channel mapping to derivatives (same as displacement)
+            float3 du = float3(pow(abs(accumDu.z), 1.4) * sign(accumDu.z), -accumDu.y, 0);
+            float3 dv = float3(pow(abs(accumDv.z), 1.4) * sign(accumDv.z), -accumDv.y, 0);
+            
+            // Base derivatives for a planar grid
+            // U direction (front-to-back): relX goes from 0 to 1 as we go from _QuadStart to _QuadEnd
+            // V direction (side-to-side): normZ goes from 0 to 1 as we go from -_HalfLength to +_HalfLength
+            float3 base_dPdu = float3((_HalfWidth * 2.0) / regionW, 0, 0); // Scaled by quad width
+            float3 base_dPdv = float3(0, 0, _HalfLength * 2.0); // Full mesh length
+            
+            // Final tangent vectors: base + displacement derivatives
+            float3 dPdu = base_dPdu + du;
+            float3 dPdv = base_dPdv + dv;
+            
+            // Calculate normal: cross(dPdv, dPdu) for right-handed system
+            float3 computedNormal = cross(dPdv, dPdu);
+            
+            // Ensure the normal is valid and facing upward
+            if (length(computedNormal) > 0.001)
+            {
+                normal = normalize(computedNormal);
+                // If normal is facing down, flip it
+                if (normal.y < 0)
+                    normal = -normal;
+            }
+        }
+    }
+    
+    _OutputNormals[idx] = normal;
+}
 

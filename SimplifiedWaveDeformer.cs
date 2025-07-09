@@ -7,6 +7,8 @@ public class SimplifiedWaveDeformer : MonoBehaviour
     [Header("Resources")]
     public ComputeShader waveCompute;
     public Texture2D deformationTexture;
+    public Texture2D partialDerivativesDU; // ∂D/∂u (colorful texture)
+    public Texture2D partialDerivativesDV; // ∂D/∂v (gray texture)
     public float displacement = 0.01f;
 
     [Header("Animation Parameter")]
@@ -19,7 +21,7 @@ public class SimplifiedWaveDeformer : MonoBehaviour
     public float quadSpeedNormalized = 0.1f;
     [Tooltip("子 Quad 划分数")]
     public int subQuadCount = 10;
-    
+
     [Header("Z-Axis Scaling")]
     [Tooltip("Z轴缩放的起始值")]
     public float zScaleStart = 1.0f;
@@ -36,11 +38,13 @@ public class SimplifiedWaveDeformer : MonoBehaviour
 
     Mesh meshInstance;
     Vector3[] originalVerts, verts;
+    Vector3[] originalNormals;
     Color[] vertexColors;
+    Vector3[] normals;
     int vertexCount, kernelCS;
     float halfW, halfZ;
 
-    ComputeBuffer inputBuffer, outputBuffer, colorBuffer;
+    ComputeBuffer inputBuffer, inputNormalBuffer, outputBuffer, colorBuffer, normalBuffer;
 
     void Start()
     {
@@ -49,11 +53,13 @@ public class SimplifiedWaveDeformer : MonoBehaviour
         meshInstance = Instantiate(mf.sharedMesh);
         mf.mesh = meshInstance;
 
-        // 2) 缓存顶点
+        // 2) 缓存顶点和法线
         originalVerts = meshInstance.vertices;
+        originalNormals = meshInstance.normals;
         vertexCount = originalVerts.Length;
         verts = new Vector3[vertexCount];
         vertexColors = new Color[vertexCount];
+        normals = new Vector3[vertexCount];
 
         // 3) 计算半宽半深
         halfW = meshInstance.bounds.extents.x;
@@ -75,16 +81,23 @@ public class SimplifiedWaveDeformer : MonoBehaviour
 
         // 5) 创建 ComputeBuffer
         inputBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
+        inputNormalBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
         outputBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
         colorBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 4);
+        normalBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
         inputBuffer.SetData(originalVerts);
+        inputNormalBuffer.SetData(originalNormals);
 
         // 6) 绑定 Shader
         kernelCS = waveCompute.FindKernel("CSMain");
         waveCompute.SetBuffer(kernelCS, "_InputPositions", inputBuffer);
+        waveCompute.SetBuffer(kernelCS, "_InputNormals", inputNormalBuffer);
         waveCompute.SetBuffer(kernelCS, "_OutputPositions", outputBuffer);
         waveCompute.SetBuffer(kernelCS, "_VertexColors", colorBuffer);
+        waveCompute.SetBuffer(kernelCS, "_OutputNormals", normalBuffer);
         waveCompute.SetTexture(kernelCS, "_DeformationTex", deformationTexture);
+        waveCompute.SetTexture(kernelCS, "_PartialDerivativesDU", partialDerivativesDU);
+        waveCompute.SetTexture(kernelCS, "_PartialDerivativesDV", partialDerivativesDV);
 
         // 7) 上传静态参数
         waveCompute.SetInt("_NumVertices", vertexCount);
@@ -104,13 +117,13 @@ public class SimplifiedWaveDeformer : MonoBehaviour
         // A) 推进动画参数 - 修复循环以避免采样伪影
         animParamStart = Mathf.Repeat(animParamStart + animSpeed * Time.deltaTime, 1f);
         animParamEnd = Mathf.Repeat(animParamEnd + animSpeed * Time.deltaTime, 1f);
-        
+
         // 确保纹理采样在 [0, 1-epsilon] 范围内以避免边界问题
         // 这防止了从 Y=1.0 采样，因为它可能与 Y=0.0 不匹配
         float texelSize = 1.0f / 256.0f; // 基于256x256纹理的纹理单元大小
         float safeAnimStart = animParamStart * (1.0f - texelSize);
         float safeAnimEnd = animParamEnd * (1.0f - texelSize);
-        
+
         waveCompute.SetFloat("_AnimStart", safeAnimStart);
         waveCompute.SetFloat("_AnimEnd", safeAnimEnd);
         Debug.Log($"[Debug] _AnimStart={safeAnimStart:F3}, _AnimEnd={safeAnimEnd:F3}");
@@ -134,19 +147,22 @@ public class SimplifiedWaveDeformer : MonoBehaviour
         int groups = Mathf.CeilToInt(vertexCount / 128f);
         waveCompute.Dispatch(kernelCS, groups, 1, 1);
 
-        // E) 读取回写顶点和颜色
+        // E) 读取回写顶点、颜色和法线
         outputBuffer.GetData(verts);
         colorBuffer.GetData(vertexColors);
+        normalBuffer.GetData(normals);
         meshInstance.vertices = verts;
         meshInstance.colors = vertexColors;
-        meshInstance.RecalculateNormals();
+        meshInstance.normals = normals; // Use derivative-based normals
         meshInstance.RecalculateBounds();
     }
 
     void OnDestroy()
     {
         inputBuffer?.Release();
+        inputNormalBuffer?.Release();
         outputBuffer?.Release();
         colorBuffer?.Release();
+        normalBuffer?.Release();
     }
 }
