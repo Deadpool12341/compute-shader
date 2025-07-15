@@ -1,0 +1,288 @@
+#pragma kernel CSMain
+#include "UnityCG.cginc"
+
+// Buffers and resources
+StructuredBuffer<float3>   _InputPositions;
+StructuredBuffer<float3>   _InputNormals;
+RWStructuredBuffer<float3> _OutputPositions;
+RWStructuredBuffer<float4> _VertexColors;
+RWStructuredBuffer<float3> _OutputNormals;
+Texture2D<float4>          _DeformationTex;
+Texture2D<float4>          _PartialDerivativesDU;
+Texture2D<float4>          _PartialDerivativesDV;
+
+// Sampler state for texture sampling
+SamplerState linearClampSampler {
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+// Parameters
+int   _NumVertices;
+int   _GridSizeX;
+int   _GridSizeZ;
+float _HalfWidth;
+float _HalfLength;
+float _Displacement;
+float _AnimStart;
+float _AnimEnd;
+float _QuadStart;
+float _QuadEnd;
+int   _SubCount;
+float _RegionWidth;
+float _ZScale;
+float _FixedZEnd;
+
+// 预计算的常量
+#define INV_255 (1.0 / 255.0)
+#define DECODE_OFFSET float3(188, 188, 188)
+
+// 内联函数优化
+inline float3 DecodeSample(float2 uv) {
+    return (_DeformationTex.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+inline float3 DecodeDerivativeDU(float2 uv) {
+    return (_PartialDerivativesDU.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+inline float3 DecodeDerivativeDV(float2 uv) {
+    return (_PartialDerivativesDV.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+// 快速幂函数
+inline float FastPow14(float x) {
+    float x2 = x * x;
+    float x4 = x2 * x2;
+    return x4 * sqrt(x);
+}
+
+// 2D线程组 - 16x16 = 256个线程，与warp大小对齐
+[numthreads(16, 16, 1)]
+void CSMain(uint3 threadID : SV_DispatchThreadID)
+{
+    // 将2D线程ID转换为1D顶点索引
+    uint gridX = threadID.x;
+    uint gridZ = threadID.y;
+    
+    // 边界检查 - 确保不超出网格范围
+    if (gridX >= _GridSizeX || gridZ >= _GridSizeZ) return;
+    
+    // 计算1D顶点索引
+    uint idx = gridZ * _GridSizeX + gridX;
+    
+    // 安全检查 - 确保不超出顶点数组范围
+    if (idx >= _NumVertices) return;
+
+    float3 pos = _InputPositions[idx];
+    float3 originalNormal = _InputNormals[idx];
+
+    // 预计算常用值
+    float invHalfWidth2 = 1.0 / (_HalfWidth * 2.0);
+    float invHalfLength2 = 1.0 / (_HalfLength * 2.0);
+    float invSubCount = 1.0 / float(_SubCount);
+    float invZScale = 1.0 / _ZScale;
+    
+    // 利用2D网格结构优化归一化计算
+    // 使用网格坐标直接计算归一化位置，减少浮点运算
+    float normX = (pos.x + _HalfWidth) * invHalfWidth2;
+    float normZ = (pos.z + _HalfLength) * invHalfLength2;
+
+    // 计算活动区域边界
+    float fixedZEndMask = step(0.5, _FixedZEnd);
+    float activeZMin = lerp(lerp(-_HalfLength, _HalfLength, 1.0 - _ZScale), -_HalfLength, fixedZEndMask);
+    float activeZMax = lerp(_HalfLength, lerp(_HalfLength, -_HalfLength, 1.0 - _ZScale), fixedZEndMask);
+
+    // 检查是否在活动区域内
+    float inQuadX = step(_QuadStart, normX) * step(normX, _QuadEnd);
+    float inQuadZ = step(activeZMin, pos.z) * step(pos.z, activeZMax);
+    float inActiveArea = inQuadX * inQuadZ;
+
+    // 早期退出优化
+    if (inActiveArea < 0.5) {
+        _OutputPositions[idx] = pos;
+        _VertexColors[idx] = float4(1, 1, 1, 1);
+        _OutputNormals[idx] = originalNormal;
+        return;
+    }
+
+    // 预计算区域参数
+    float regionW = _QuadEnd - _QuadStart;
+    float invRegionW = 1.0 / regionW;
+    float relX = (normX - _QuadStart) * invRegionW;
+    
+    float activeNormZMin = (activeZMin + _HalfLength) * invHalfLength2;
+    float activeNormZMax = (activeZMax + _HalfLength) * invHalfLength2;
+    float activeNormZRange = activeNormZMax - activeNormZMin;
+    float invActiveNormZRange = 1.0 / activeNormZRange;
+
+    // 计算逻辑Z位置
+    float logicalZ = (normZ - activeNormZMin) * invActiveNormZRange;
+    
+    // 预计算子四边形相关参数
+    float subWindowZ = invSubCount;
+    float compressionFactor = invZScale;
+    float spreadRadius = subWindowZ * (compressionFactor - 1.0) * 0.5;
+    
+    // 优化的子四边形范围计算
+    int minSubQuad = max(0, (int)((logicalZ - spreadRadius) * _SubCount));
+    int maxSubQuad = min(_SubCount - 1, (int)((logicalZ + spreadRadius) * _SubCount + 0.999));
+    
+    // 累积变量 - 使用共享内存优化可能在这里有帮助
+    float3 accumO = float3(0, 0, 0);
+    float accumW = 0.0;
+    float3 accumDu = float3(0, 0, 0);
+    float3 accumDv = float3(0, 0, 0);
+    float accumDerivW = 0.0;
+    int hitCount = 0;
+    
+    // 优化的主循环 - 相邻线程处理相邻顶点，提高缓存命中率
+    for (int i = minSubQuad; i <= maxSubQuad; i++)
+    {
+        // 预计算子四边形边界
+        float startZ = i * invSubCount;
+        float endZ = (i + 1) * invSubCount;
+        
+        float effectiveStartZ = startZ - spreadRadius;
+        float effectiveEndZ = endZ + spreadRadius;
+        
+        // 使用数学运算代替分支检查
+        float inRange = step(effectiveStartZ, logicalZ) * step(logicalZ, effectiveEndZ);
+        
+        if (inRange > 0.5)
+        {
+            // 计算权重
+            float effectiveRange = effectiveEndZ - effectiveStartZ;
+            float t = (logicalZ - effectiveStartZ) / effectiveRange;
+            float w = saturate(1.0 - abs(2.0 * t - 1.0));
+            
+            if (w > 0.0)
+            {
+                hitCount++;
+                
+                // 动画参数计算
+                float t_i = i * invSubCount;
+                float t_i1 = (i + 1) * invSubCount;
+                
+                // 处理动画参数，支持包装
+                float paramL, paramR;
+                if (_AnimStart <= _AnimEnd) {
+                    paramL = lerp(_AnimStart, _AnimEnd, t_i);
+                    paramR = lerp(_AnimStart, _AnimEnd, t_i1);
+                } else {
+                    float adjustedEnd = _AnimEnd + 1.0;
+                    paramL = fmod(lerp(_AnimStart, adjustedEnd, t_i), 1.0);
+                    paramR = fmod(lerp(_AnimStart, adjustedEnd, t_i1), 1.0);
+                }
+                
+                // 计算原始T值
+                float originalT = saturate((logicalZ - startZ) * _SubCount);
+                
+                // 2D纹理采样优化 - 相邻线程访问相邻纹理像素
+                float2 uvL = float2(relX, paramL);
+                float2 uvR = float2(relX, paramR);
+                
+                // 批量纹理采样
+                float3 sampL = DecodeSample(uvL);
+                float3 sampR = DecodeSample(uvR);
+                float3 raw = lerp(sampL, sampR, originalT);
+                
+                // 同时计算偏导数
+                float3 duL = DecodeDerivativeDU(uvL);
+                float3 duR = DecodeDerivativeDU(uvR);
+                float3 duInterp = lerp(duL, duR, originalT);
+                
+                float3 dvL = DecodeDerivativeDV(uvL);
+                float3 dvR = DecodeDerivativeDV(uvR);
+                float3 dvInterp = lerp(dvL, dvR, originalT);
+                
+                // 累积结果
+                accumO += raw * w;
+                accumW += w;
+                accumDu += duInterp * w;
+                accumDv += dvInterp * w;
+                accumDerivW += w;
+            }
+        }
+    }
+
+    // 归一化累积结果
+    float invAccumW = 1.0 / max(accumW, 0.001);
+    float invAccumDerivW = 1.0 / max(accumDerivW, 0.001);
+    accumO *= invAccumW * step(0.001, accumW);
+    accumDu *= invAccumDerivW * step(0.001, accumDerivW);
+    accumDv *= invAccumDerivW * step(0.001, accumDerivW);
+
+    // 优化的通道映射
+    float3 offWorld = float3(FastPow14(abs(accumO.z)) * sign(accumO.z), -accumO.y, 0);
+    _OutputPositions[idx] = pos + offWorld;
+
+    // 优化的颜色计算 - 利用2D网格结构进行边界检测
+    float4 baseColor = float4(1, 1, 1, 1);
+    
+    // 重叠区域检测
+    float isOverlap = step(1.5, hitCount);
+    baseColor = lerp(baseColor, float4(0, 0, 1, 1), isOverlap);
+    
+    // 边界检测优化 - 利用2D网格坐标
+    float relativeX = (normX - _QuadStart) * invRegionW;
+    float isXEdge = step(relativeX, 0.01) + step(0.99, relativeX);
+    float tolerance = 0.01;
+    float isZEdge = step(abs(normZ - activeNormZMin), tolerance) + step(abs(normZ - activeNormZMax), tolerance);
+    float isQuadEdge = saturate(isXEdge + isZEdge);
+    
+    // 子四边形边界检测
+    float isSubQuadEdge = 0.0;
+    for (int i = 0; i < _SubCount - 1; i++)
+    {
+        float startZi1 = (i + 1) * invSubCount;
+        float endZi = (i + 1) * invSubCount;
+        
+        float effectiveStartZi1 = startZi1 - spreadRadius;
+        float effectiveEndZi = endZi + spreadRadius;
+        
+        isSubQuadEdge += step(abs(logicalZ - effectiveStartZi1), 0.002);
+        isSubQuadEdge += step(abs(logicalZ - effectiveEndZi), 0.002);
+    }
+    isSubQuadEdge = saturate(isSubQuadEdge);
+    
+    // 优先级颜色选择
+    float4 vertexColor = lerp(baseColor, float4(1, 0, 0, 1), isSubQuadEdge);
+    vertexColor = lerp(vertexColor, float4(0, 1, 0, 1), isQuadEdge);
+    
+    _VertexColors[idx] = vertexColor;
+
+    // 优化的法线计算
+    float3 normal = originalNormal;
+    
+    float hasDeformation = step(0.001, accumDerivW);
+    if (hasDeformation > 0.5)
+    {
+        // 应用通道映射到导数
+        float3 du = float3(FastPow14(abs(accumDu.z)) * sign(accumDu.z), -accumDu.y, 0);
+        float3 dv = float3(FastPow14(abs(accumDv.z)) * sign(accumDv.z), -accumDv.y, 0);
+        
+        // 基础切线向量
+        float3 base_dPdu = float3((_HalfWidth * 2.0) * invRegionW, 0, 0);
+        float3 base_dPdv = float3(0, 0, _HalfLength * 2.0);
+        
+        // 最终切线向量
+        float3 dPdu = base_dPdu + du;
+        float3 dPdv = base_dPdv + dv;
+        
+        // 计算法线
+        float3 computedNormal = cross(dPdv, dPdu);
+        float normalLength = length(computedNormal);
+        
+        // 使用数学运算代替分支
+        float validNormal = step(0.001, normalLength);
+        float3 normalizedNormal = computedNormal / max(normalLength, 0.001);
+        float upwardFacing = step(0.0, normalizedNormal.y);
+        normalizedNormal = lerp(-normalizedNormal, normalizedNormal, upwardFacing);
+        
+        normal = lerp(normal, normalizedNormal, validNormal);
+    }
+    
+    _OutputNormals[idx] = normal;
+} 
