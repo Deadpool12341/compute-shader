@@ -1,0 +1,326 @@
+#pragma kernel CSMain
+#include "UnityCG.cginc"
+
+// Buffers and resources
+StructuredBuffer<float3>   _InputPositions;
+StructuredBuffer<float3>   _InputNormals;
+RWStructuredBuffer<float3> _OutputPositions;
+RWStructuredBuffer<float4> _VertexColors;
+RWStructuredBuffer<float3> _OutputNormals;
+RWStructuredBuffer<float2> _OutUVCorr;  // Corrected UV coordinates for Shader Graph
+RWStructuredBuffer<float>  _FoamIntensity; // Foam intensity based on wave deformation
+
+Texture2D<float4> _DeformationTex;
+Texture2D<float4> _PartialDerivativesDU;
+Texture2D<float4> _PartialDerivativesDV;
+
+// NEW: UV Offset（RG = Δu, Δv；0–255 编码）
+Texture2D<float4> _UVOffsetTex;
+
+// Sampler state for texture sampling
+SamplerState linearClampSampler {
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+// Parameters
+uint  _NumVertices;
+uint  _GridSizeX;
+uint  _GridSizeZ;
+float _HalfWidth;
+float _HalfLength;
+float _Displacement;
+float _AnimStart;
+float _AnimEnd;
+float _QuadStart;
+float _QuadEnd;
+int   _SubCount;
+float _RegionWidth;
+float _ZScale;
+float _FixedZEnd;
+
+// NEW: UV Offset 强度与偏置（与 0–255 编码匹配）
+float _UvOffsetScale = 1.0;   // 缩放 Δuv
+float _UvOffsetBias  = 188.0; // 若贴图以 128 为零点，就设为 128
+
+// 预计算的常量
+#define INV_255 (1.0 / 255.0)
+#define DECODE_OFFSET float3(188, 188, 188)
+
+// 内联函数优化（解码位移/偏导：0..255 → 去偏置 → 放缩）
+inline float3 DecodeSample(float2 uv) {
+    return (_DeformationTex.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+inline float3 DecodeDerivativeDU(float2 uv) {
+    return (_PartialDerivativesDU.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+inline float3 DecodeDerivativeDV(float2 uv) {
+    return (_PartialDerivativesDV.SampleLevel(linearClampSampler, uv, 0).rgb * 255.0 - DECODE_OFFSET) * _Displacement;
+}
+
+// NEW: 解码 UV Offset（RG：0..255 → [-1,1] 范围，188 为零点）
+inline float2 DecodeUVOffset(float2 uv)
+{
+    float2 rg = _UVOffsetTex.SampleLevel(linearClampSampler, uv, 0).rg * 255.0;
+    // 你当前实现：以 188 为零点，但用 /255.0（范围非对称）
+    float2 normalized = (rg - float2(188, 188)) / 255.0;
+    return normalized * _UvOffsetScale;
+}
+
+// 快速幂函数
+inline float FastPow14(float x) {
+    float x2 = x * x;
+    float x4 = x2 * x2;
+    return x4 * sqrt(x);
+}
+
+// 2D线程组 - 16x16 = 256个线程
+[numthreads(16, 16, 1)]
+void CSMain(uint3 threadID : SV_DispatchThreadID)
+{
+    // 将2D线程ID转换为1D顶点索引
+    uint gridX = threadID.x;
+    uint gridZ = threadID.y;
+
+    // 边界检查 - 确保不超出网格范围
+    if (gridX >= _GridSizeX || gridZ >= _GridSizeZ) return;
+
+    // 计算1D顶点索引
+    uint idx = gridZ * _GridSizeX + gridX;
+    if (idx >= _NumVertices) return;
+
+    float3 pos            = _InputPositions[idx];
+    float3 originalNormal = _InputNormals[idx];
+
+    // 预计算常用值
+    float invHalfWidth2  = 1.0 / (_HalfWidth * 2.0);
+    float invHalfLength2 = 1.0 / (_HalfLength * 2.0);
+    float invSubCount    = 1.0 / float(_SubCount);
+    float invZScale      = 1.0 / _ZScale;
+
+    // 归一化位置
+    float normX = (pos.x + _HalfWidth)  * invHalfWidth2;
+    float normZ = (pos.z + _HalfLength) * invHalfLength2;
+
+    // 计算活动区域边界
+    float fixedZEndMask = step(0.5, _FixedZEnd);
+    float activeZMin = lerp(lerp(-_HalfLength, _HalfLength, 1.0 - _ZScale), -_HalfLength, fixedZEndMask);
+    float activeZMax = lerp(_HalfLength, lerp(_HalfLength, -_HalfLength, 1.0 - _ZScale), fixedZEndMask);
+
+    float inQuadX = step(_QuadStart, normX) * step(normX, _QuadEnd);
+    float inQuadZ = step(activeZMin, pos.z) * step(pos.z, activeZMax);
+    float inActiveArea = inQuadX * inQuadZ;
+
+    if (inActiveArea < 0.5) {
+        _OutputPositions[idx] = pos;
+        _VertexColors[idx]    = float4(1, 1, 1, 0);   // alpha = 0 outside quad
+        _OutputNormals[idx]   = originalNormal;
+        // For inactive area, use original normalized mesh coordinates
+        _OutUVCorr[idx]       = float2(normX, normZ);
+        _FoamIntensity[idx]   = 0.0; // No foam in inactive areas
+        return;
+    }
+
+    // 区域参数
+    float regionW     = _QuadEnd - _QuadStart;
+    float invRegionW  = 1.0 / regionW;
+    float relX        = (normX - _QuadStart) * invRegionW;
+
+    float activeNormZMin      = (activeZMin + _HalfLength) * invHalfLength2;
+    float activeNormZMax      = (activeZMax + _HalfLength) * invHalfLength2;
+    float activeNormZRange    = activeNormZMax - activeNormZMin;
+    float invActiveNormZRange = 1.0 / activeNormZRange;
+
+    // 逻辑 Z（0..1）
+    float logicalZ = (normZ - activeNormZMin) * invActiveNormZRange;
+
+    // Subquad 参数
+    float subWindowZ       = invSubCount;
+    float compressionFactor = invZScale;
+    float spreadRadius     = subWindowZ * (compressionFactor - 1.0) * 0.5;
+
+    int minSubQuad = max(0, (int)((logicalZ - spreadRadius) * _SubCount));
+    int maxSubQuad = min(_SubCount - 1, (int)((logicalZ + spreadRadius) * _SubCount + 0.999));
+
+    // 累积器
+    float3 accumO      = float3(0,0,0);
+    float  accumW      = 0.0;
+    float3 accumDu     = float3(0,0,0);
+    float3 accumDv     = float3(0,0,0);
+    float  accumDerivW = 0.0;
+    float2 accumUVCorr = float2(0,0); // UV correction accumulator
+    int    hitCount    = 0;
+
+    // 主循环
+    for (int i = minSubQuad; i <= maxSubQuad; i++)
+    {
+        float startZ = i * invSubCount;
+        float endZ   = (i + 1) * invSubCount;
+
+        float effectiveStartZ = startZ - spreadRadius;
+        float effectiveEndZ   = endZ   + spreadRadius;
+
+        float inRange = step(effectiveStartZ, logicalZ) * step(logicalZ, effectiveEndZ);
+        if (inRange > 0.5)
+        {
+            float effectiveRange = effectiveEndZ - effectiveStartZ;
+            float t = (logicalZ - effectiveStartZ) / effectiveRange;
+            float w = saturate(1.0 - abs(2.0 * t - 1.0));
+
+            if (w > 0.0)
+            {
+                hitCount++;
+
+                // 动画参数（考虑 wrap）
+                float t_i  = i * invSubCount;
+                float t_i1 = (i + 1) * invSubCount;
+
+                float paramL, paramR;
+                if (_AnimStart <= _AnimEnd) {
+                    paramL = lerp(_AnimStart, _AnimEnd, t_i);
+                    paramR = lerp(_AnimStart, _AnimEnd, t_i1);
+                } else {
+                    float adjustedEnd = _AnimEnd + 1.0;
+                    paramL = fmod(lerp(_AnimStart, adjustedEnd, t_i), 1.0);
+                    paramR = fmod(lerp(_AnimStart, adjustedEnd, t_i1), 1.0);
+                }
+
+                float originalT = saturate((logicalZ - startZ) * _SubCount);
+
+                // —— 在循环里对 L/R 端点采样 UV Offset ——
+                float2 uvL_base = float2(relX, paramL);
+                float2 uvR_base = float2(relX, paramR);
+
+                float2 offL = DecodeUVOffset(uvL_base); // RG: 0..255 → 去偏置 → *Scale
+                float2 offR = DecodeUVOffset(uvR_base);
+
+                float2 uvL = uvL_base + offL;
+                float2 uvR = uvR_base + offR;
+
+                // 该子区间用于采样的 UV
+                float2 uvChosen = lerp(uvL, uvR, originalT);
+
+                // 位移采样与插值
+                float3 sampL = DecodeSample(uvL);
+                float3 sampR = DecodeSample(uvR);
+                float3 raw   = lerp(sampL, sampR, originalT);
+
+                // 偏导采样与插值
+                float3 duL = DecodeDerivativeDU(uvL);
+                float3 duR = DecodeDerivativeDU(uvR);
+                float3 duInterp = lerp(duL, duR, originalT);
+
+                float3 dvL = DecodeDerivativeDV(uvL);
+                float3 dvR = DecodeDerivativeDV(uvR);
+                float3 dvInterp = lerp(dvL, dvR, originalT);
+
+                // 加权累积
+                accumO      += raw      * w;
+                accumW      += w;
+                accumDu     += duInterp * w;
+                accumDv     += dvInterp * w;
+                accumDerivW += w;
+                accumUVCorr += uvChosen * w; // 记录实际采样 UV
+            }
+        }
+    }
+
+    // 归一化
+    float invAccumW      = 1.0 / max(accumW, 0.001);
+    float invAccumDerivW = 1.0 / max(accumDerivW, 0.001);
+
+    accumO  *= invAccumW      * step(0.001, accumW);
+    accumDu *= invAccumDerivW * step(0.001, accumDerivW);
+    accumDv *= invAccumDerivW * step(0.001, accumDerivW);
+
+    // Normalize corrected UV (use same weight as displacement)
+    float2 uvCorrAvg = accumUVCorr * invAccumW * step(0.001, accumW);
+
+    // 通道映射 & 非线性 → 世界位移
+    float3 offWorld = float3(
+        FastPow14(abs(accumO.z)) * sign(accumO.z),
+       -accumO.y,
+        0
+    );
+    _OutputPositions[idx] = pos + offWorld;
+
+    // 顶点色调试（重叠/边界/子区间边界）
+    float4 baseColor = float4(1, 1, 1, 1);
+    float isOverlap = step(1.5, hitCount);
+    baseColor = lerp(baseColor, float4(0, 0, 1, 1), isOverlap);
+
+    float relativeX = (normX - _QuadStart) * invRegionW;
+    float isXEdge = step(relativeX, 0.01) + step(0.99, relativeX);
+    float tolerance = 0.01;
+    float isZEdge = step(abs(normZ - activeNormZMin), tolerance) + step(abs(normZ - activeNormZMax), tolerance);
+    float isQuadEdge = saturate(isXEdge + isZEdge);
+
+    float isSubQuadEdge = 0.0;
+    for (int j = 0; j < _SubCount - 1; j++)
+    {
+        float startZi1 = (j + 1) * invSubCount;
+        float endZi    = (j + 1) * invSubCount;
+        float effectiveStartZi1 = startZi1 - spreadRadius;
+        float effectiveEndZi    = endZi    + spreadRadius;
+
+        isSubQuadEdge += step(abs(logicalZ - effectiveStartZi1), 0.002);
+        isSubQuadEdge += step(abs(logicalZ - effectiveEndZi),   0.002);
+    }
+    isSubQuadEdge = saturate(isSubQuadEdge);
+
+    float4 vertexColor = lerp(baseColor, float4(1, 0, 0, 1), isSubQuadEdge);
+    vertexColor = lerp(vertexColor, float4(0, 1, 0, 1), isQuadEdge);
+    _VertexColors[idx] = float4(vertexColor.rgb, 1.0);  // alpha = 1 inside quad
+
+    // 法线重建（用修正后的 dP/du, dP/dv）
+    float3 normal = originalNormal;
+    float hasDeformation = step(0.001, accumDerivW);
+    if (hasDeformation > 0.5)
+    {
+        float3 du = float3(
+            FastPow14(abs(accumDu.z)) * sign(accumDu.z),
+           -accumDu.y,
+            0
+        );
+        float3 dv = float3(
+            FastPow14(abs(accumDv.z)) * sign(accumDv.z),
+           -accumDv.y,
+            0
+        );
+
+        float3 base_dPdu = float3((_HalfWidth * 2.0) * invRegionW, 0, 0);
+        float3 base_dPdv = float3(0, 0, _HalfLength * 2.0);
+
+        float3 dPdu = base_dPdu + du;
+        float3 dPdv = base_dPdv + dv;
+
+        float3 computedNormal = cross(dPdv, dPdu);
+        float  normalLength   = length(computedNormal);
+
+        float validNormal = step(0.001, normalLength);
+        float3 normalizedNormal = computedNormal / max(normalLength, 0.001);
+        float upwardFacing = step(0.0, normalizedNormal.y);
+        normalizedNormal = lerp(-normalizedNormal, normalizedNormal, upwardFacing);
+
+        normal = lerp(normal, normalizedNormal, validNormal);
+    }
+
+    _OutputNormals[idx] = normal;
+
+    // Output the corrected UV coordinates for Shader Graph
+    _OutUVCorr[idx] = uvCorrAvg;
+
+    // Calculate foam intensity based on wave deformation strength
+    float deformationMagnitude = length(offWorld);
+    float foamIntensity = saturate(deformationMagnitude * 10.0); // Scale factor for foam sensitivity
+
+    // Add foam at wave peaks and troughs (high derivative areas)
+    float3 totalDerivative = accumDu + accumDv;
+    float derivativeMagnitude = length(totalDerivative);
+    foamIntensity += saturate(derivativeMagnitude * 5.0); // Additional foam from high-curvature areas
+
+    _FoamIntensity[idx] = saturate(foamIntensity);
+}
