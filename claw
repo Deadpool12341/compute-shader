@@ -1,0 +1,189 @@
+#pragma kernel CSMain
+
+RWStructuredBuffer<float3> vertexBuffer;
+RWStructuredBuffer<float3> normalBuffer;
+
+float time;
+float clawHeight;
+float clawCurvature;
+float clawBendAngle;
+float baseHeightOffset;
+float tipToTwoThirdsRadius;
+float twoThirdsToOneThirdRadius;
+float oneThirdToEdgeRadius;
+int gridWidth;
+int gridHeight;
+
+float3 CalculateClawDisplacement(float2 uv, float2 center)
+{
+    float2 offset = uv - center;
+    float distance = length(offset);
+    
+    // Calculate normalized parameter t: from outer boundary (t=0) to claw tip (t=1)
+    float maxRadius = 0.4; // Active deformation radius
+    
+    // t = 0 at boundary, t = 1 at center (tip)
+    float t = saturate(1.0 - distance / maxRadius);
+    
+    // If outside deformation area, only apply base height offset
+    if (t <= 0.0)
+    {
+        return float3(0, baseHeightOffset, 0);
+    }
+    
+    // Calculate angle around the center (for plane tilting direction)
+    float angle = atan2(offset.y, offset.x);
+    
+    // Define tilt direction (clawCurvature controls which direction the plane tilts towards)
+    float tiltDirection = clawCurvature; // This determines the tilt axis direction
+    
+    // Define three control layers at t=1/3, t=2/3, t=1
+    float t_layer1 = 1.0/3.0; // First control layer
+    float t_layer2 = 2.0/3.0; // Second control layer  
+    float t_layer3 = 1.0;     // Tip layer (single point)
+    
+    // Control parameters for each layer - PLANE TILTING angles (based on clawBendAngle)
+    float baseAngleRad = clawBendAngle * 3.14159 / 180.0;
+    float planeTilt1 = baseAngleRad * 0.33;  // 1/3 of bend angle at t=1/3
+    float planeTilt2 = baseAngleRad * 0.67;  // 2/3 of bend angle at t=2/3  
+    float planeTilt3 = baseAngleRad;         // Full bend angle at t=1
+    
+    float baseHeight1 = 0.2; // Base height at t=1/3
+    float baseHeight2 = 0.5; // Base height at t=2/3
+    float baseHeight3 = 1.0; // Max height at t=1 (tip)
+    
+    // Interpolate parameters based on current t value
+    float currentPlaneTilt, currentBaseHeight;
+    
+    if (t <= t_layer1)
+    {
+        // Interpolate from base (0) to layer 1
+        float alpha = t / t_layer1;
+        currentPlaneTilt = lerp(0, planeTilt1, alpha);
+        currentBaseHeight = lerp(0, baseHeight1, alpha);
+    }
+    else if (t <= t_layer2)
+    {
+        // Interpolate from layer 1 to layer 2
+        float alpha = (t - t_layer1) / (t_layer2 - t_layer1);
+        currentPlaneTilt = lerp(planeTilt1, planeTilt2, alpha);
+        currentBaseHeight = lerp(baseHeight1, baseHeight2, alpha);
+    }
+    else
+    {
+        // Interpolate from layer 2 to layer 3 (tip)
+        float alpha = (t - t_layer2) / (t_layer3 - t_layer2);
+        currentPlaneTilt = lerp(planeTilt2, planeTilt3, alpha);
+        currentBaseHeight = lerp(baseHeight2, baseHeight3, alpha);
+        
+        // For the tip region, gradually converge to a single point
+        float convergeFactor = alpha; // 0 at layer2, 1 at center
+        distance = distance * (1.0 - convergeFactor * 0.8);
+    }
+    
+    // Calculate plane tilting effect
+    // The plane tilts such that one side is higher than the other
+    float tiltEffect = cos(angle - tiltDirection);
+    
+    // Base vertical displacement for this ring with height offset
+    float baseVerticalDisplacement = clawHeight * currentBaseHeight + baseHeightOffset;
+    
+    // Add strong tilt effect: one side much higher, one side much lower
+    // Use the full tilt angle and make the effect much more pronounced
+    float tiltMagnitude = tan(currentPlaneTilt) * distance * clawHeight;
+    float tiltHeightDifference = tiltMagnitude * tiltEffect * abs(clawCurvature) * 0.5;
+    float finalVerticalDisplacement = baseVerticalDisplacement + tiltHeightDifference;
+    
+    // Ensure minimum height to prevent negative Y values
+    finalVerticalDisplacement = max(finalVerticalDisplacement, baseHeightOffset * 0.1);
+    
+    // Calculate horizontal offset due to plane tilting
+    // When a plane tilts, points move horizontally as well
+    float2 tiltDirection2D = float2(cos(tiltDirection), sin(tiltDirection));
+    float horizontalTiltOffset = tiltMagnitude * sin(currentPlaneTilt) * abs(clawCurvature) * 0.3;
+    float2 horizontalOffset = tiltDirection2D * horizontalTiltOffset;
+    
+    // Add forward extension in X direction (not radial!)
+    // All vertices move forward in X direction, with inner vertices moving more
+    float forwardExtension = t * clawHeight * 0.3; // Only move in positive X direction
+    float3 forwardOffset = float3(forwardExtension, 0, 0);
+    
+    // Apply radius scaling to horizontal offsets for circumference control
+    float radiusScale = 1.0;
+    if (t > t_layer2) // Tip to 2/3 region
+    {
+        radiusScale = tipToTwoThirdsRadius;
+    }
+    else if (t > t_layer1) // 2/3 to 1/3 region
+    {
+        radiusScale = twoThirdsToOneThirdRadius;
+    }
+    else if (t > 0) // 1/3 to edge region
+    {
+        radiusScale = oneThirdToEdgeRadius;
+    }
+    
+    // Scale horizontal positions to control circumference
+    horizontalOffset *= radiusScale;
+    
+    // Add subtle animation
+    float waveEffect = sin(time * 1.5 + angle * 3.0 + distance * 8.0) * 0.02 * t;
+    finalVerticalDisplacement += waveEffect;
+    
+    return float3(horizontalOffset.x + forwardOffset.x, finalVerticalDisplacement, horizontalOffset.y);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * gridWidth;
+    uint totalVertices = gridWidth * gridHeight;
+    
+    // Boundary check
+    if (index >= totalVertices) return;
+    
+    // More precise center calculation for even/odd grid sizes
+    float centerX = (gridWidth - 1) * 0.5;
+    float centerY = (gridHeight - 1) * 0.5;
+    
+    // Convert to UV coordinates relative to exact center
+    float u = ((float)id.x - centerX) / (gridWidth - 1) + 0.5;
+    float v = ((float)id.y - centerY) / (gridHeight - 1) + 0.5;
+    float2 uv = float2(u, v);
+    
+    // Exact center point
+    float2 center = float2(0.5, 0.5);
+    
+    // Get original vertex position
+    float3 originalPos = vertexBuffer[index];
+    
+    // Calculate claw displacement using the new layered system
+    float3 displacement = CalculateClawDisplacement(uv, center);
+    
+    // Apply displacement
+    float3 newPos = originalPos + displacement;
+    
+    // Update vertex position
+    vertexBuffer[index] = newPos;
+    
+    // Calculate improved normal based on displacement
+    float3 normal = float3(0, 1, 0);
+    float distanceFromCenter = length(uv - center);
+    
+    if (distanceFromCenter <= 0.5)
+    {
+        // Calculate normal based on the tilt direction
+        float2 offset = uv - center;
+        float2 direction = distance(uv, center) > 0.001 ? normalize(offset) : float2(0, 1);
+        
+        // Create tangent vectors based on displacement
+        float3 tangentU = float3(direction.x, displacement.y * 0.5, 0);
+        float3 tangentV = float3(0, displacement.y * 0.5, direction.y);
+        
+        // Cross product to get normal
+        float3 crossResult = cross(normalize(tangentU), normalize(tangentV));
+        normal = length(crossResult) > 0.001 ? normalize(crossResult) : float3(0, 1, 0);
+    }
+    
+    normalBuffer[index] = normal;
+}
