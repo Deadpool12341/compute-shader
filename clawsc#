@@ -1,0 +1,197 @@
+using UnityEngine;
+
+[RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
+public class ClawDeformer : MonoBehaviour
+{
+    [Header("Compute Shader")]
+    public ComputeShader clawComputeShader;
+    
+    [Header("Claw Parameters")]
+    [Range(0f, 20f)]
+    public float clawHeight = 5f;
+    
+    [Range(-10f, 10f)]
+    public float clawCurvature = 1f;
+    
+    [Range(-90f, 90f)]
+    public float clawBendAngle = 30f;
+    
+    [Range(0f, 5f)]
+    public float baseHeightOffset = 0.5f;
+    
+    [Header("Ring Circumference Control")]
+    [Range(0.1f, 5f)]
+    public float tipToTwoThirdsRadius = 1f;
+    
+    [Range(0.1f, 5f)]
+    public float twoThirdsToOneThirdRadius = 1f;
+    
+    [Range(0.1f, 5f)]
+    public float oneThirdToEdgeRadius = 1f;
+    
+    [Header("Animation")]
+    public bool animate = true;
+    
+    [Header("Mesh Settings")]
+    [Range(8, 128)]
+    public int meshResolution = 32;
+
+    private Mesh originalMesh;
+    private Mesh deformedMesh;
+    private Vector3[] originalVertices;
+    private Vector3[] deformedVertices;
+    private Vector3[] deformedNormals;
+    
+    private ComputeBuffer vertexBuffer;
+    private ComputeBuffer normalBuffer;
+    private int kernelIndex;
+    
+    private MeshFilter meshFilter;
+
+    void Start()
+    {
+        meshFilter = GetComponent<MeshFilter>();
+        
+        // Create or get plane mesh
+        CreatePlaneMesh();
+        
+        // Initialize compute shader
+        InitializeComputeShader();
+    }
+
+    void CreatePlaneMesh()
+    {
+        // Create a custom plane mesh with specified resolution
+        originalMesh = new Mesh();
+        originalMesh.name = "Claw Plane";
+        
+        int vertexCount = meshResolution * meshResolution;
+        originalVertices = new Vector3[vertexCount];
+        Vector2[] uvs = new Vector2[vertexCount];
+        
+        // Create vertices
+        for (int y = 0; y < meshResolution; y++)
+        {
+            for (int x = 0; x < meshResolution; x++)
+            {
+                int index = y * meshResolution + x;
+                float u = (float)x / (meshResolution - 1);
+                float v = (float)y / (meshResolution - 1);
+                
+                originalVertices[index] = new Vector3(u - 0.5f, 0f, v - 0.5f) * 10f;
+                uvs[index] = new Vector2(u, v);
+            }
+        }
+        
+        // Create triangles
+        int triangleCount = (meshResolution - 1) * (meshResolution - 1) * 6;
+        int[] triangles = new int[triangleCount];
+        int triIndex = 0;
+        
+        for (int y = 0; y < meshResolution - 1; y++)
+        {
+            for (int x = 0; x < meshResolution - 1; x++)
+            {
+                int bottomLeft = y * meshResolution + x;
+                int bottomRight = bottomLeft + 1;
+                int topLeft = bottomLeft + meshResolution;
+                int topRight = topLeft + 1;
+                
+                // First triangle
+                triangles[triIndex++] = bottomLeft;
+                triangles[triIndex++] = topLeft;
+                triangles[triIndex++] = bottomRight;
+                
+                // Second triangle
+                triangles[triIndex++] = bottomRight;
+                triangles[triIndex++] = topLeft;
+                triangles[triIndex++] = topRight;
+            }
+        }
+        
+        originalMesh.vertices = originalVertices;
+        originalMesh.triangles = triangles;
+        originalMesh.uv = uvs;
+        originalMesh.RecalculateNormals();
+        
+        // Create deformed mesh
+        deformedMesh = Instantiate(originalMesh);
+        deformedVertices = new Vector3[vertexCount];
+        deformedNormals = new Vector3[vertexCount];
+        
+        meshFilter.mesh = deformedMesh;
+    }
+
+    void InitializeComputeShader()
+    {
+        if (clawComputeShader == null)
+        {
+            Debug.LogError("Claw Compute Shader not assigned!");
+            return;
+        }
+        
+        kernelIndex = clawComputeShader.FindKernel("CSMain");
+        
+        int vertexCount = originalVertices.Length;
+        
+        // Create compute buffers
+        vertexBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
+        normalBuffer = new ComputeBuffer(vertexCount, sizeof(float) * 3);
+        
+        // Set buffers on compute shader
+        clawComputeShader.SetBuffer(kernelIndex, "vertexBuffer", vertexBuffer);
+        clawComputeShader.SetBuffer(kernelIndex, "normalBuffer", normalBuffer);
+        
+        // Set mesh parameters
+        clawComputeShader.SetInt("gridWidth", meshResolution);
+        clawComputeShader.SetInt("gridHeight", meshResolution);
+    }
+
+    void Update()
+    {
+        if (clawComputeShader == null || vertexBuffer == null) return;
+        
+        // Update compute shader parameters
+        clawComputeShader.SetFloat("clawHeight", clawHeight);
+        clawComputeShader.SetFloat("clawCurvature", clawCurvature);
+        clawComputeShader.SetFloat("clawBendAngle", clawBendAngle);
+        clawComputeShader.SetFloat("baseHeightOffset", baseHeightOffset);
+        clawComputeShader.SetFloat("tipToTwoThirdsRadius", tipToTwoThirdsRadius);
+        clawComputeShader.SetFloat("twoThirdsToOneThirdRadius", twoThirdsToOneThirdRadius);
+        clawComputeShader.SetFloat("oneThirdToEdgeRadius", oneThirdToEdgeRadius);
+        clawComputeShader.SetFloat("time", animate ? Time.time : 0f);
+        
+        // Copy original vertices to buffer
+        vertexBuffer.SetData(originalVertices);
+        
+        // Dispatch compute shader with proper thread group calculation
+        int threadGroupsX = Mathf.CeilToInt(meshResolution / 8.0f);
+        int threadGroupsY = Mathf.CeilToInt(meshResolution / 8.0f);
+        clawComputeShader.Dispatch(kernelIndex, threadGroupsX, threadGroupsY, 1);
+        
+        // Get results back from compute shader
+        vertexBuffer.GetData(deformedVertices);
+        normalBuffer.GetData(deformedNormals);
+        
+        // Update mesh
+        deformedMesh.vertices = deformedVertices;
+        deformedMesh.normals = deformedNormals;
+        deformedMesh.RecalculateBounds();
+    }
+
+    void OnDestroy()
+    {
+        // Clean up compute buffers
+        if (vertexBuffer != null)
+        {
+            vertexBuffer.Release();
+            vertexBuffer = null;
+        }
+        
+        if (normalBuffer != null)
+        {
+            normalBuffer.Release();
+            normalBuffer = null;
+        }
+    }
+}
